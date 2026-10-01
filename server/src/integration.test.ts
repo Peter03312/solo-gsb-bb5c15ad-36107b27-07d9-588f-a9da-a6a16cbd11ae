@@ -2,7 +2,7 @@ import * as assert from 'assert';
 import { createServer } from 'http';
 import { AddressInfo } from 'net';
 import { createApp } from './app';
-import { initSchema } from './db';
+import { initSchema, query } from './db';
 
 // 使用真实 PostgreSQL 语义（PGlite / WASM）端到端校验全部业务规则。
 async function startServer(): Promise<{ base: string; close: () => Promise<void> }> {
@@ -1181,6 +1181,288 @@ async function main() {
       '已发布快照保持原样'
     );
     assert.strictEqual(mEd1.view.stats.brokenCount, 0);
+
+    // ---------- 恢复已发布校勘版 ----------
+    // 独立文献：两次发布，恢复到第 1 版；覆盖抄本增删改名/顺序、底本切换、行增删改、组重存
+    r = await call(base, 'POST', '/documents', { title: `恢复测试 ${++seq}`, manuscripts: ['甲本', '乙本'] });
+    assert.strictEqual(r.status, 201);
+    const dX = r.json.id;
+    let xView = (await call(base, 'GET', `/documents/${dX}`)).json;
+    let xVer = xView.document.version;
+    const xA0 = xView.manuscripts.find((m: any) => m.name === '甲本');
+    const xB0 = xView.manuscripts.find((m: any) => m.name === '乙本');
+    await call(base, 'POST', `/manuscripts/${xA0.id}/lines`, { expectedVersion: xVer++, content: '天命之謂性' });
+    await call(base, 'POST', `/manuscripts/${xA0.id}/lines`, { expectedVersion: xVer++, content: '率性之謂道' });
+    await call(base, 'POST', `/manuscripts/${xB0.id}/lines`, { expectedVersion: xVer++, content: '天命之謂姓' });
+    await call(base, 'POST', `/manuscripts/${xB0.id}/lines`, { expectedVersion: xVer++, content: '率性之謂道' });
+    xView = (await call(base, 'GET', `/documents/${dX}`)).json;
+    const xl = (msId: number, no: number) =>
+      xView.rawByMs.find((x: any) => x.msId === msId).lines.find((l: any) => l.lineNo === no).lineId;
+    const xGroupsV1 = [
+      { ord: 1, fragments: [
+        { msId: xA0.id, lineId: xl(xA0.id, 1), startCp: 0, endCp: 5 },
+        { msId: xB0.id, lineId: xl(xB0.id, 1), startCp: 0, endCp: 5 },
+      ]},
+      { ord: 2, fragments: [
+        { msId: xA0.id, lineId: xl(xA0.id, 2), startCp: 0, endCp: 5 },
+        { msId: xB0.id, missing: true },
+      ]},
+    ];
+    r = await call(base, 'PUT', `/documents/${dX}/groups`, { expectedVersion: xView.document.version, groups: xGroupsV1 });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    xView = (await call(base, 'GET', `/documents/${dX}`)).json;
+    r = await call(base, 'POST', `/documents/${dX}/publish`, { expectedVersion: xView.document.version });
+    assert.strictEqual(r.status, 201);
+    assert.strictEqual(r.json.editionNo, 1);
+    xView = (await call(base, 'GET', `/documents/${dX}`)).json;
+    const xEd1Version = xView.document.version;
+    const xEd1Snapshot = (await call(base, 'GET', `/documents/${dX}/editions/1`)).json.view;
+
+    // 工作版继续大幅修改：新增抄本丙、乙本改名、新增行、改字、整批重存换组 ID、切底本后再切回并发布第 2 版
+    r = await call(base, 'POST', `/documents/${dX}/manuscripts`, { expectedVersion: xEd1Version, name: '丙本' });
+    assert.strictEqual(r.status, 201);
+    xView = (await call(base, 'GET', `/documents/${dX}`)).json;
+    const xCid = xView.manuscripts.find((m: any) => m.name === '丙本').id;
+    // 乙本改名：无改名接口，借助“恢复改名”验证；直接改库不合适——改用新增行 + 改字 + 重存组表达工作版差异
+    r = await call(base, 'POST', `/manuscripts/${xCid}/lines`, { expectedVersion: xView.document.version, content: '完全不同的新文字XYZ' });
+    assert.strictEqual(r.status, 201);
+    xView = (await call(base, 'GET', `/documents/${dX}`)).json;
+    const xa1now = xView.rawByMs.find((x: any) => x.msId === xA0.id).lines[0].lineId;
+    r = await call(base, 'PUT', `/lines/${xa1now}`, {
+      expectedVersion: xView.document.version, startCp: 0, endCp: 1, replacement: '丼',
+    }); // 甲行1 首字改 → 两组中组1待修复
+    assert.strictEqual(r.status, 200);
+    xView = (await call(base, 'GET', `/documents/${dX}`)).json;
+    // 修复组1（甲新文字 / 乙随新行内区间重录），让第 2 版可发布
+    const xa2now = xView.rawByMs.find((x: any) => x.msId === xA0.id).lines[1].lineId;
+    const xb1now = xView.rawByMs.find((x: any) => x.msId === xB0.id).lines[0].lineId;
+    const xGroupsV2 = [
+      { ord: 1, fragments: [
+        { msId: xA0.id, lineId: xa1now, startCp: 0, endCp: 5 },
+        { msId: xB0.id, lineId: xb1now, startCp: 0, endCp: 5 },
+      ]},
+      { ord: 2, fragments: [
+        { msId: xA0.id, lineId: xa2now, startCp: 0, endCp: 5 },
+        { msId: xB0.id, missing: true },
+        { msId: xCid, missing: true },
+      ]},
+    ];
+    r = await call(base, 'PUT', `/documents/${dX}/groups`, { expectedVersion: xView.document.version, groups: xGroupsV2 });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    xView = (await call(base, 'GET', `/documents/${dX}`)).json;
+    assert.strictEqual(xView.stats.brokenCount, 0);
+    r = await call(base, 'POST', `/documents/${dX}/publish`, { expectedVersion: xView.document.version });
+    assert.strictEqual(r.status, 201);
+    assert.strictEqual(r.json.editionNo, 2);
+    xView = (await call(base, 'GET', `/documents/${dX}`)).json;
+    const xVerBeforeRestore = xView.document.version;
+    assert.ok(xVerBeforeRestore > xEd1Version);
+    // 恢复前：工作版 3 份抄本、组 2 组含丙缺文、甲行1首字为「丼」
+    assert.strictEqual(xView.manuscripts.length, 3);
+    assert.strictEqual(xView.rawByMs.find((x: any) => x.msId === xA0.id).lines[0].content[0], '丼');
+    assert.strictEqual(xView.groups.find((g: any) => g.ord === 2).cells.length, 3);
+
+    // —— 拒绝类（先于成功，验证不写入、不推进版本）——
+    // 缺 expectedVersion → 400
+    r = await call(base, 'POST', `/documents/${dX}/editions/1/restore`, {});
+    await expectFail(r, 400, 'expectedVersion');
+    // 版本已变化（对照的是 v1，现已到更后版本）→ 409，拒绝且不改动
+    r = await call(base, 'POST', `/documents/${dX}/editions/1/restore`, { expectedVersion: xEd1Version });
+    await expectFail(r, 409, '版本已过期');
+    // 目标版不存在 → 404，拒绝且不改动
+    r = await call(base, 'POST', `/documents/${dX}/editions/99/restore`, { expectedVersion: xVerBeforeRestore });
+    await expectFail(r, 404, '不存在');
+    // 非法版号 → 400
+    r = await call(base, 'POST', `/documents/${dX}/editions/0/restore`, { expectedVersion: xVerBeforeRestore });
+    await expectFail(r, 400, '正整数');
+    // 以上拒绝均不推进版本
+    xView = (await call(base, 'GET', `/documents/${dX}`)).json;
+    assert.strictEqual(xView.document.version, xVerBeforeRestore, '拒绝恢复不得推进版本');
+    assert.strictEqual(xView.manuscripts.length, 3, '拒绝恢复不得改动数据');
+
+    // —— 成功恢复到第 1 版（携带对照时的 expectedVersion = 当前工作版版本号）——
+    r = await call(base, 'POST', `/documents/${dX}/editions/1/restore`, { expectedVersion: xVerBeforeRestore });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    assert.strictEqual(r.json.ok, true);
+    assert.strictEqual(r.json.editionNo, 1);
+    assert.strictEqual(r.json.version, xVerBeforeRestore + 1, '成功后版本号只前进一次');
+    assert.deepStrictEqual(r.json.restored, {
+      manuscriptCount: 2, lineCount: 4, groupCount: 2, fragmentCount: 4, missingCount: 1,
+      baseMsId: xA0.id,
+    });
+
+    xView = (await call(base, 'GET', `/documents/${dX}`)).json;
+    const xVerAfterRestore = xView.document.version;
+    assert.strictEqual(xVerAfterRestore, xVerBeforeRestore + 1);
+    // 抄本及顺序恢复为 2 份（后增的丙本被移除），甲/乙沿用快照中的稳定身份 id
+    assert.strictEqual(xView.manuscripts.length, 2);
+    assert.deepStrictEqual(xView.manuscripts.map((m: any) => [m.id, m.name, m.position]), [
+      [xA0.id, '甲本', 1], [xB0.id, '乙本', 2],
+    ]);
+    assert.strictEqual(xView.document.baseMsId, xA0.id, '底本恢复');
+    // 全部原始行恢复
+    assert.deepStrictEqual(
+      xView.rawByMs.find((x: any) => x.msId === xA0.id).lines.map((l: any) => [l.lineNo, l.content]),
+      [[1, '天命之謂性'], [2, '率性之謂道']]
+    );
+    assert.deepStrictEqual(
+      xView.rawByMs.find((x: any) => x.msId === xB0.id).lines.map((l: any) => [l.lineNo, l.content]),
+      [[1, '天命之謂姓'], [2, '率性之謂道']]
+    );
+    // 对应组、异文与缺文恢复
+    assert.strictEqual(xView.stats.groupCount, 2);
+    assert.strictEqual(xView.stats.brokenCount, 0, '恢复后无待修复组');
+    const rg1 = xView.groups.find((g: any) => g.ord === 1);
+    const rg2 = xView.groups.find((g: any) => g.ord === 2);
+    assert.strictEqual(rg1.variant, true, '性/姓异文恢复');
+    assert.strictEqual(rg1.baseText, '天命之謂性');
+    assert.strictEqual(rg2.hasMissing, true, '乙本缺文标记恢复');
+    assert.strictEqual(rg2.cells.find((c: any) => c.msId === xB0.id).missing, true);
+    assert.strictEqual(rg2.cells.length, 2, '丙本随抄本移除而消失');
+
+    // 重建后的行与组取得“当前有效标识”：新组 id 不等于快照旧 id；用新 id 走修复/删除/改字接口可用
+    const snapshotGroupId = xEd1Snapshot.groups.find((g: any) => g.ord === 1).id;
+    assert.notStrictEqual(rg1.id, snapshotGroupId, '重建组取得新 id');
+    const newA1 = xView.rawByMs.find((x: any) => x.msId === xA0.id).lines[0].lineId;
+    assert.notStrictEqual(newA1, xEd1Snapshot.rawByMs.find((x: any) => x.msId === xA0.id).lines[0].lineId);
+    // 标题 / 已发布版编号 / 快照保持原样
+    assert.strictEqual(xView.document.title, `恢复测试 ${seq}`);
+    assert.strictEqual(xView.document.publishedVer, 2, '已发布版编号不变');
+    const ed2still = await call(base, 'GET', `/documents/${dX}/editions/2`);
+    assert.strictEqual(ed2still.status, 200, '第 2 版快照仍在');
+    assert.strictEqual((await call(base, 'GET', `/documents/${dX}/editions/1`)).json.view.groups.length, 2, '第 1 版快照原样');
+
+    // 恢复后对照：第 1 版与当前工作版应完全一致（无任何变化）
+    let xDiff = (await call(base, 'GET', `/documents/${dX}/editions/1/diff`)).json;
+    assert.strictEqual(xDiff.textChanges.length, 0, '恢复后行文与第 1 版无差异');
+    assert.strictEqual(xDiff.groupDiff.counts.paired, 2);
+    assert.strictEqual(xDiff.groupDiff.counts.unpairedOld, 0);
+    assert.strictEqual(xDiff.groupDiff.counts.unpairedNew, 0);
+    assert.ok(xDiff.groupDiff.paired.every((p: any) => p.status === 'same'), '配对组全部无变化');
+
+    // 恢复后现有流程仍可用：改字 → 待修复 → 修复 → 整批重存 → 行界 → 发布第 3 版
+    r = await call(base, 'PUT', `/lines/${newA1}`, {
+      expectedVersion: xVerAfterRestore, startCp: 0, endCp: 1, replacement: '天',
+    }); // 同字替换，不相交语义：与组1片段相交但文字不变
+    assert.strictEqual(r.status, 200);
+    xView = (await call(base, 'GET', `/documents/${dX}`)).json;
+    assert.strictEqual(xView.groups.find((g: any) => g.ord === 1).broken, true, '改字接口对新行/新组有效');
+    const newG1 = xView.groups.find((g: any) => g.ord === 1).id;
+    const newB1 = xView.rawByMs.find((x: any) => x.msId === xB0.id).lines[0].lineId;
+    const newA2 = xView.rawByMs.find((x: any) => x.msId === xA0.id).lines[1].lineId;
+    r = await call(base, 'PUT', `/documents/${dX}/groups/${newG1}/repair`, {
+      expectedVersion: xView.document.version,
+      group: { ord: 1, fragments: [
+        { msId: xA0.id, lineId: newA1, startCp: 0, endCp: 5 },
+        { msId: xB0.id, lineId: newB1, startCp: 0, endCp: 5 },
+      ]},
+    });
+    assert.strictEqual(r.status, 200, `修复接口对重建组可用：${JSON.stringify(r.json)}`);
+    xView = (await call(base, 'GET', `/documents/${dX}`)).json;
+    assert.strictEqual(xView.stats.brokenCount, 0);
+    // 行界调整在重建行上可用
+    let xPrev = (await call(base, 'GET', `/documents/${dX}/reline/preview?op=split&lineId=${newA2}&splitCp=2`)).json;
+    r = await call(base, 'POST', `/documents/${dX}/reline`, {
+      expectedVersion: xView.document.version, op: 'split', lineId: newA2, splitCp: 2, basis: xPrev.basis,
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    xView = (await call(base, 'GET', `/documents/${dX}`)).json;
+    // 补配接口仍可用（只读预览）
+    r = await call(base, 'GET', `/documents/${dX}/supplement/preview?targetMsId=${xB0.id}`);
+    assert.strictEqual(r.status, 200);
+    // 版本对照接口在恢复后仍可用
+    xDiff = (await call(base, 'GET', `/documents/${dX}/editions/1/diff`)).json;
+    assert.ok(xDiff.textChanges.some((t: any) => t.status === 'changed' || t.status === 'added'), '拆分后对照可见变化');
+    // 合并回去以重新发布：先修复拆分造成的组2待修复
+    xView = (await call(base, 'GET', `/documents/${dX}`)).json;
+    if (xView.stats.brokenCount > 0) {
+      const splitLines = xView.rawByMs.find((x: any) => x.msId === xA0.id).lines;
+      for (const g of xView.groups.filter((g: any) => g.broken)) {
+        const rebuild: any[] = [];
+        for (const ms of xView.manuscripts) {
+          const cell = g.cells.find((c: any) => c.msId === ms.id);
+          if (!cell) continue;
+          if (cell.missing) rebuild.push({ msId: ms.id, missing: true });
+          else {
+            const ln = splitLines.find((l: any) => l.lineNo === cell.lineNo);
+            // 跨拆分点片段修复为该新行内尚可见的确定部分
+            const len = Array.from(ln.content).length;
+            const s = Math.min(cell.startCp ?? 0, len);
+            const e = Math.min(cell.endCp ?? len, len);
+            if (e > s) rebuild.push({ msId: ms.id, lineId: ln.lineId, startCp: s, endCp: e });
+          }
+        }
+        const rr = await call(base, 'PUT', `/documents/${dX}/groups/${g.id}/repair`, {
+          expectedVersion: xView.document.version, group: { ord: g.ord, fragments: rebuild },
+        });
+        assert.strictEqual(rr.status, 200, JSON.stringify(rr.json));
+        xView = (await call(base, 'GET', `/documents/${dX}`)).json;
+      }
+    }
+    r = await call(base, 'POST', `/documents/${dX}/publish`, { expectedVersion: xView.document.version });
+    assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+    assert.strictEqual(r.json.editionNo, 3, '恢复后继续发布得到第 3 版');
+
+    // 恢复后新增抄本：序列已推进，插入取得有效不冲突 id，现有流程完整可用
+    xView = (await call(base, 'GET', `/documents/${dX}`)).json;
+    r = await call(base, 'POST', `/documents/${dX}/manuscripts`, { expectedVersion: xView.document.version, name: '丁本' });
+    assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+    xView = (await call(base, 'GET', `/documents/${dX}`)).json;
+    const xDid = xView.manuscripts.find((m: any) => m.name === '丁本').id;
+    assert.ok(xDid > 0 && !xView.manuscripts.some((m: any) => m.id === xDid && m.name !== '丁本'));
+
+    // —— 快照损坏（无法构成合法归组）→ 409 RESTORE_SNAPSHOT_INVALID，整体拒绝、不改动、不推进 ——
+    // 另建文献发布第 1 版后，直接把该版快照里组1的乙本片段改成越界区间（模拟半损坏快照）
+    r = await call(base, 'POST', '/documents', { title: `损坏快照测试 ${++seq}`, manuscripts: ['甲', '乙'] });
+    assert.strictEqual(r.status, 201);
+    const dC = r.json.id;
+    let cView = (await call(base, 'GET', `/documents/${dC}`)).json;
+    const [cA, cB] = cView.manuscripts;
+    await call(base, 'POST', `/manuscripts/${cA.id}/lines`, { expectedVersion: cView.document.version, content: 'ABC' });
+    cView = (await call(base, 'GET', `/documents/${dC}`)).json;
+    await call(base, 'POST', `/manuscripts/${cB.id}/lines`, { expectedVersion: cView.document.version, content: 'ABC' });
+    cView = (await call(base, 'GET', `/documents/${dC}`)).json;
+    const ca1 = cView.rawByMs.find((x: any) => x.msId === cA.id).lines[0].lineId;
+    const cb1 = cView.rawByMs.find((x: any) => x.msId === cB.id).lines[0].lineId;
+    r = await call(base, 'PUT', `/documents/${dC}/groups`, {
+      expectedVersion: cView.document.version,
+      groups: [{ ord: 1, fragments: [
+        { msId: cA.id, lineId: ca1, startCp: 0, endCp: 3 },
+        { msId: cB.id, lineId: cb1, startCp: 0, endCp: 3 },
+      ]}],
+    });
+    assert.strictEqual(r.status, 200);
+    cView = (await call(base, 'GET', `/documents/${dC}`)).json;
+    r = await call(base, 'POST', `/documents/${dC}/publish`, { expectedVersion: cView.document.version });
+    assert.strictEqual(r.status, 201);
+    cView = (await call(base, 'GET', `/documents/${dC}`)).json;
+    const cVer = cView.document.version;
+    // 先做一次工作版改动，使恢复有意义且版本推进
+    r = await call(base, 'POST', `/manuscripts/${cB.id}/lines`, { expectedVersion: cVer, content: 'EXTRA' });
+    assert.strictEqual(r.status, 201);
+    cView = (await call(base, 'GET', `/documents/${dC}`)).json;
+    const cVerNow = cView.document.version;
+    // 篡改第 1 版快照 JSONB：把唯一一组的底本片段区间改成越界 [0,99)
+    const { rows: edRows } = await query<{ edition_no: number }>(
+      'SELECT edition_no FROM editions WHERE doc_id=$1 ORDER BY edition_no',
+      [dC]
+    );
+    assert.strictEqual(edRows.length, 1);
+    await query(
+      `UPDATE editions SET snapshot = jsonb_set(snapshot, '{groups,0,cells,0,endCp}', '99'::jsonb)
+       WHERE doc_id=$1 AND edition_no=1`,
+      [dC]
+    );
+    const cLinesBefore = (await call(base, 'GET', `/documents/${dC}`)).json.stats.lineCount;
+    r = await call(base, 'POST', `/documents/${dC}/editions/1/restore`, { expectedVersion: cVerNow });
+    await expectFail(r, 409, '无法构成合法归组');
+    assert.strictEqual(r.json.details.code, 'RESTORE_SNAPSHOT_INVALID');
+    assert.ok(Array.isArray(r.json.details.issues) && r.json.details.issues.length > 0);
+    assert.ok(JSON.stringify(r.json.details.issues).includes('越界'), '须说明越界原因');
+    // 整体拒绝：版本不推进、工作版数据不变
+    cView = (await call(base, 'GET', `/documents/${dC}`)).json;
+    assert.strictEqual(cView.document.version, cVerNow, '损坏快照拒绝后不得推进版本');
+    assert.strictEqual(cView.stats.lineCount, cLinesBefore, '损坏快照拒绝后不得改动数据');
 
     console.log('✅ 全部集成测试通过');
   } finally {

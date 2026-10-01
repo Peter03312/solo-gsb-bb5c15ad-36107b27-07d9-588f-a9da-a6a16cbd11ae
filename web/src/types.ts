@@ -321,3 +321,19 @@ export interface ReLineResult {
   version: number;
   result: ReLinePlan;
 }
+
+// ---- 恢复已发布校勘版 ----
+
+export interface RestoreResult {
+  ok: boolean;
+  editionNo: number;
+  version: number;
+  restored: {
+    manuscriptCount: number;
+    lineCount: number;
+    groupCount: number;
+    fragmentCount: number;
+    missingCount: number;
+    baseMsId: number;
+  };
+}

@@ -1,16 +1,19 @@
 import { useCallback, useEffect, useState } from 'react';
-import { api } from '../api';
+import { api, ApiError } from '../api';
+import { ErrorBox } from '../ErrorBox';
 import type {
   CellChange,
   EditionDiff,
   LineDiff,
+  RestoreResult,
   UnpairedCell,
   UnpairedGroupDiff,
 } from '../types';
 
 /**
  * 版本对照页：任一已发布校勘版（旧 · 不可变快照）vs 当前工作版（新 · 实时）。
- * 只读：本页不做任何写操作；点“刷新”即按当前最新工作版重新对照。
+ * 默认只读；查看对照后可在此页“确认恢复”——以该已发布版整体重建工作版
+ * （抄本及顺序 / 底本 / 全部原始行 / 对应组片段与缺文标记；标题、已发布编号与快照不动）。
  * 页面数据与 GET /api/documents/:id/editions/:no/diff 返回的 JSON 完全一致。
  */
 export function EditionDiffPage({
@@ -26,16 +29,22 @@ export function EditionDiffPage({
 }) {
   const [data, setData] = useState<EditionDiff | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [errDetails, setErrDetails] = useState<unknown>(null);
   const [loading, setLoading] = useState(false);
+  const [restoring, setRestoring] = useState(false);
+  const [restoreResult, setRestoreResult] = useState<RestoreResult | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     setErr(null);
+    setErrDetails(null);
+    setRestoreResult(null);
     try {
       setData(await api.getEditionDiff(docId, editionNo));
     } catch (e) {
       setData(null);
       setErr(String((e as Error).message ?? e));
+      setErrDetails((e as ApiError).details ?? null);
     } finally {
       setLoading(false);
     }
@@ -44,6 +53,31 @@ export function EditionDiffPage({
   useEffect(() => {
     load();
   }, [load]);
+
+  const restore = async () => {
+    if (!data) return;
+    const expectedVersion = data.sides.new.version;
+    const ok = window.confirm(
+      `确认将当前工作版恢复为第 ${editionNo} 版？\n\n` +
+      '恢复范围：抄本及顺序、底本、全部原始行、对应组片段与缺文标记，将被整体重建为该版定稿状态；\n' +
+      '文献标题、已发布版编号与全部已发布快照保持原样。\n\n' +
+      `本次提交基于对照时的工作版 v${expectedVersion}；若工作版已被他人改动，将拒绝且不写入。`
+    );
+    if (!ok) return;
+    setRestoring(true);
+    setErr(null);
+    setErrDetails(null);
+    try {
+      const r = await api.restoreEdition(docId, editionNo, expectedVersion);
+      setRestoreResult(r);
+      setData(null); // 对照结果已基于旧工作版；恢复后需刷新才能重新对照
+    } catch (e) {
+      setErr(String((e as Error).message ?? e));
+      setErrDetails((e as ApiError).details ?? null);
+    } finally {
+      setRestoring(false);
+    }
+  };
 
   const apiUrl = `/api/documents/${docId}/editions/${editionNo}/diff`;
 
@@ -59,8 +93,25 @@ export function EditionDiffPage({
       </div>
 
       <div className="container">
-        {err && <div className="error-box">{err}</div>}
-        {!data && !err && <div className="muted">正在生成对照…</div>}
+        {err && <ErrorBox message={err} issues={errDetails} />}
+        {!data && !err && !restoreResult && <div className="muted">正在生成对照…</div>}
+
+        {restoreResult && (
+          <div className="card">
+            <div className="ok-box" style={{ marginBottom: 10 }}>
+              ✓ 已将工作版整体恢复为第 {restoreResult.editionNo} 版定稿；工作版版本号前进至
+              <strong> v{restoreResult.version}</strong>（仅前进一次）。
+              重建抄本 {restoreResult.restored.manuscriptCount} 份、原始行 {restoreResult.restored.lineCount} 行、
+              对应组 {restoreResult.restored.groupCount} 组（片段 {restoreResult.restored.fragmentCount} 个，
+              其中缺文 {restoreResult.restored.missingCount} 处）。行与组已取得当前有效标识；
+              文献标题、已发布版编号与快照均未改动。
+            </div>
+            <div className="row-flex">
+              <button className="primary" onClick={onBack}>返回工作区查看恢复结果</button>
+              <button onClick={load}>重新生成对照（按新工作版）</button>
+            </div>
+          </div>
+        )}
 
         {data && (
           <>
@@ -85,8 +136,23 @@ export function EditionDiffPage({
                 </div>
               </div>
               <div className="muted" style={{ marginTop: 8 }}>
-                对照生成于 {new Date(data.generatedAt).toLocaleString('zh-CN')}（只读，不修改工作版与快照；刷新反映最新工作版）。
+                对照生成于 {new Date(data.generatedAt).toLocaleString('zh-CN')}（对照只读，不修改工作版与快照；刷新反映最新工作版）。
               </div>
+            </div>
+
+            <div className="card">
+              <h3>确认恢复为第 {editionNo} 版</h3>
+              <div className="muted" style={{ marginBottom: 10 }}>
+                查看上方对照后，可将当前工作版<strong>整体恢复</strong>为本已发布版：
+                抄本及顺序、底本、全部原始行、对应组片段与缺文标记全部重建为该版定稿状态；
+                文献标题、已发布版编号与全部已发布快照保持原样。重建后的行与组取得当前有效标识，
+                现有编辑、对照与发布流程仍可继续使用。
+                提交携带对照时的工作版版本号 <strong>v{data.sides.new.version}</strong>；
+                若期间工作版已变化则拒绝且不改动数据。
+              </div>
+              <button className="primary" disabled={restoring || loading} onClick={restore}>
+                {restoring ? '恢复中…' : `确认恢复（基于 v${data.sides.new.version}）`}
+              </button>
             </div>
 
             <div className="card">

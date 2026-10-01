@@ -9,6 +9,7 @@ import {
   recheckSelections,
 } from './supplement';
 import { applyReLinePlan, buildReLinePlan } from './reline';
+import { applyRestore, buildRestorePlan } from './restore';
 import { charLen, HttpError, isInt, sliceCp } from './util';
 import {
   bumpVersion,
@@ -703,5 +704,63 @@ router.get(
       return buildEditionDiff(oldView, newView, rows[0].created_at.toISOString());
     });
     res.json(result);
+  })
+);
+
+/**
+ * 恢复已发布校勘版：
+ *   POST /api/documents/:id/editions/:no/restore  { expectedVersion }
+ * 整理者在“发布与旧版”中选取已发布校勘版、查看它与当前工作版的对照后确认恢复。
+ *  - expectedVersion 必须是对照时看到的当前工作版版本号；版本已变化 → 409，拒绝且不改动数据；
+ *  - 目标版不存在 → 404，拒绝且不改动数据；
+ *  - 快照内容无法构成合法归组（结构损坏 / 缺底本 / 越界 / 重叠 …）→ 409 RESTORE_SNAPSHOT_INVALID，
+ *    details.issues 逐条说明，整体拒绝且不改动数据；
+ *  - 恢复范围：抄本及顺序、底本、全部原始行、对应组片段与缺文标记；
+ *    文献标题、已发布版编号和快照保持原样。
+ * 成功后工作版版本号只前进一次，返回新版本号；重建后的行与组取得当前有效标识。
+ */
+router.post(
+  '/documents/:id/editions/:no/restore',
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const no = Number(req.params.no);
+    if (!isInt(no) || no < 1) throw new HttpError(400, '校勘版编号必须是正整数');
+    const result = await withTx(async (c) => {
+      const doc = await lockDoc(c, id);
+      checkVersion(doc, req.body?.expectedVersion); // 版本已变化 → 409，不改动数据
+      const { rows } = await c.query<{ snapshot: unknown }>(
+        'SELECT snapshot FROM editions WHERE doc_id=$1 AND edition_no=$2',
+        [id, no]
+      );
+      if (rows.length === 0) {
+        throw new HttpError(
+          404,
+          doc.published_ver === 0
+            ? `校勘版 #${no} 不存在：本文献尚未发布过任何校勘版，无法恢复`
+            : `校勘版 #${no} 不存在：当前仅发布至第 ${doc.published_ver} 版，无法恢复`,
+          { requestedEdition: no, latestEdition: doc.published_ver }
+        );
+      }
+
+      // 解析快照并以同一套归组规则校验；无法构成合法归组 → 409 RESTORE_SNAPSHOT_INVALID（此前无任何写入）
+      const plan = buildRestorePlan(rows[0].snapshot);
+
+      await applyRestore(c, id, plan);
+      await bumpVersion(c, id); // 成功后工作版版本号只前进一次
+      const after = await getDoc(c, id);
+      return {
+        editionNo: no,
+        version: after.version,
+        restored: {
+          manuscriptCount: plan.stats.manuscriptCount,
+          lineCount: plan.stats.lineCount,
+          groupCount: plan.stats.groupCount,
+          fragmentCount: plan.stats.fragmentCount,
+          missingCount: plan.stats.missingCount,
+          baseMsId: plan.baseMsId,
+        },
+      };
+    });
+    res.json({ ok: true, ...result });
   })
 );

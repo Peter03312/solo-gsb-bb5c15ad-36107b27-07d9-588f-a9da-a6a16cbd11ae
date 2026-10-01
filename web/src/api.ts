@@ -62,6 +62,12 @@ export const api = {
     ),
   getEditionDiff: (id: number, no: number) =>
     req<EditionDiff>('GET', `/api/documents/${id}/editions/${no}/diff`),
+  restoreEdition: (id: number, no: number, expectedVersion: number) =>
+    req<RestoreResult>(
+      'POST',
+      `/api/documents/${id}/editions/${no}/restore`,
+      { expectedVersion }
+    ),
   supplementPreview: (id: number, targetMsId: number) =>
     req<SupplementPreview>('GET', `/api/documents/${id}/supplement/preview?targetMsId=${targetMsId}`),
   supplementCommit: (
@@ -99,6 +105,7 @@ import type {
   ReLineBasis,
   ReLinePreview,
   ReLineResult,
+  RestoreResult,
   SupplementPreview,
   SupplementResult,
   SupplementSelection,

@@ -219,6 +219,8 @@ curl -X POST http://localhost:4000/api/documents/1/reline \
 ### 发布与旧版
 - 发布生成 **不可变快照**（JSONB，固化发布定稿时的版本号）。发布后继续修改只影响工作版，
   **旧发布版始终可阅读**（“发布与旧版”页签 → 阅读此版）。
+- 在版本对照页查看某已发布版与当前工作版的差异后，可点 **“确认恢复”** 将工作版整体恢复为该版
+  （规则见下文“恢复已发布校勘版”）。
 
 ### 版本对照（任一已发布校勘版 ↔ 当前工作版）
 - 在“发布与旧版”页签对任一已发布版本点 **“与当前工作版对照”**（或在旧版阅读页点同名按钮），
@@ -244,6 +246,53 @@ curl -X POST http://localhost:4000/api/documents/1/reline \
   返回：`sides`（两侧底本/版本号/组数/待修复数）、`textChanges`（行文增删改）、
   `groupDiff.paired`（配对组的组序与各抄本片段、缺文变化）、
   `groupDiff.unpairedOld / unpairedNew`（未配对旧/新组及原因）。
+
+### 恢复已发布校勘版（以旧版整体重建当前工作版）
+整理者在“发布与旧版”中选取一个**已发布校勘版**，点“与当前工作版对照”查看差异后，
+在版本对照页点 **“确认恢复”**（也可直接调 HTTP API）：
+
+- **恢复范围**：该版快照中的**抄本及顺序、底本、全部原始行、对应组片段与缺文标记**，
+  被整体重建为该版定稿状态——发布后新增的抄本/行/组被移除，删除/改动的内容复原，
+  整批重存后的组按快照重放。**文献标题、已发布版编号（`published_ver`）和全部快照
+  （含目标版自身）保持原样**，旧版仍可阅读、对照。
+- **有效标识**：重建后的**行与组取得当前有效标识**（全新 id；不沿用快照中的旧行/旧组 id）；
+  抄本沿用其跨版本的稳定身份 id（快照中缺失的抄本按原 id 补回，序列自动推进）。
+  因此恢复后现有的行内改字、行界调整、整批归组、单组修复、删除、补配、对照、发布流程
+  **全部仍可正常使用**。
+- **乐观锁**：提交必须携带**对照时看到的当前工作版版本号** `expectedVersion`。
+  - 版本已变化（`expectedVersion` ≠ 当前版本）→ **409**，拒绝且**不改动任何数据**；
+  - 目标版不存在 → **404**（提示当前已发布至第几版），拒绝且不改动数据；版号非法 → 400；
+  - **快照内容无法构成合法归组**（快照结构损坏、底本/行缺失、片段越界、行内重叠、
+    片段文字与原文区间不符、组序不连续等）→ **409**，
+    `details.code=RESTORE_SNAPSHOT_INVALID`、`details.issues[]` 逐条给出 `code` 与位置
+    （组序 / 抄本名 / 行号 / 区间），**整体拒绝且不改动数据、不推进版本**。
+    （正常发布产生的快照必为合法归组；该校验用于抵御任何半损坏 / 被篡改的快照。）
+- **成功后工作版版本号只前进一次**，返回 `{ ok, editionNo, version, restored }`，
+  `restored` 给出重建的抄本/行/组/片段/缺文计数与底本 id。恢复后再做版本对照，
+  该版与当前工作版应完全一致（无行文变化、配对组全部 `same`）。
+
+接口：
+
+```bash
+# expectedVersion 取对照（GET .../diff）时返回的 sides.new.version
+curl -X POST http://localhost:4000/api/documents/1/editions/1/restore \
+  -H 'Content-Type: application/json' \
+  -d '{ "expectedVersion": 12 }'
+```
+
+成功返回：
+
+```json
+{
+  "ok": true,
+  "editionNo": 1,
+  "version": 13,
+  "restored": {
+    "manuscriptCount": 3, "lineCount": 6, "groupCount": 4,
+    "fragmentCount": 10, "missingCount": 2, "baseMsId": 7
+  }
+}
+```
 
 
 ### 并发控制
@@ -274,6 +323,7 @@ curl -X POST http://localhost:4000/api/documents/1/reline \
 | POST | `/api/documents/:id/publish` | 发布新版（有待修复组则 409） |
 | GET | `/api/documents/:id/editions` / `…/editions/:no` | 版本列表 / 阅读旧版快照 |
 | GET | `/api/documents/:id/editions/:no/diff` | **该已发布版与当前工作版的版本对照**（旧版不存在 → 404） |
+| POST | `/api/documents/:id/editions/:no/restore` | **确认恢复为该已发布版**（整体重建抄本/底本/行/组片段/缺文；版本过期 409、版不存在 404、快照不合法 409 `RESTORE_SNAPSHOT_INVALID`，皆不改动数据；成功只推进一次版本） |
 
 写请求体均含 `expectedVersion`；错误响应：`{ "error": "...", "details": [ { "code", "message", "groupOrd", "msName", "lineNo", ... } ] }`。
 
@@ -304,7 +354,12 @@ npm test
 缺文标记不变、合并右行片段迁至左行且原待修复组不自动转完好、行号顺移、发布后快照保持原样、
 发布门禁与待修复一致（待修复 409、修复后放行）、非法码点位置/非相邻行/自身合并/跨抄本/他文献行 400、
 行或文献不存在 404、扩展 B 区生僻字按码点拆分、预览只读不推进、缺 basis 400、
-过期版本 409 与 basis 不符 409（RELINE_STALE）皆整次拒绝不推进、成功只推进一次版本**。
+过期版本 409 与 basis 不符 409（RELINE_STALE）皆整次拒绝不推进、成功只推进一次版本**，以及
+**恢复已发布校勘版：抄本及顺序/底本/全部原始行/组片段与缺文整体重建、后增抄本移除、
+标题与已发布版编号及全部快照不变、重建行与组取得新 id 而抄本沿用稳定身份、
+恢复后与该版对照完全一致、恢复后改字/修复/行界/补配/对照/再发布/新增抄本全流程可用、
+成功版本号只前进一次、缺 expectedVersion 400、版本已变化 409 不改动、目标版不存在 404、
+损坏快照（片段越界）409 RESTORE_SNAPSHOT_INVALID 逐条说明且整体拒绝不推进版本**。
 
 ---
 
@@ -316,7 +371,7 @@ npm test
 ├── docker-compose.yml        # 一键：db(PostgreSQL 16) + app
 ├── db/schema.sql             # 数据库结构（幂等，可重复执行）
 ├── server/                   # Node.js + TypeScript + Express
-│   └── src/ (db/validate/collation/diff/supplement/reline/routes/repo/...)
+│   └── src/ (db/validate/collation/diff/supplement/reline/restore/routes/repo/...)
 └── web/                      # React 18 + Vite + TypeScript
     └── src/ (录文 / 归组 / 对照 / 发布与旧版 / 版本对照)
 ```
