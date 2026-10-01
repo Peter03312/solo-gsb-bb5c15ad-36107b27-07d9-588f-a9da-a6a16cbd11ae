@@ -40,6 +40,12 @@ export function App() {
         editionNo={route.no}
         onBack={() => setRoute({ name: 'doc', id: route.id })}
         onHome={() => setRoute({ name: 'home' })}
+        onRestored={(newVersion) => {
+          // 恢复成功：回到工作区（重新挂载即拉取新版本工作版）
+          setRoute({ name: 'doc', id: route.id });
+          // 新版本号已由工作区重新加载；保留参数便于将来提示扩展
+          void newVersion;
+        }}
       />
     );
   }

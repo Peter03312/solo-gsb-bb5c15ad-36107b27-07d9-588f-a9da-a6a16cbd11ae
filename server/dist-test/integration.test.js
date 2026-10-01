@@ -1105,6 +1105,226 @@ async function main() {
         assert.strictEqual(mEd1.view.document.version, mEd1Version, '快照版本号固化');
         assert.deepStrictEqual(mEd1.view.rawByMs.find((x) => x.msId === mA.id).lines.map((l) => l.content), ['天命之謂性', '率性之謂道', '修道之謂教'], '已发布快照保持原样');
         assert.strictEqual(mEd1.view.stats.brokenCount, 0);
+        // ---------- 从已发布校勘版恢复当前工作版 ----------
+        // 新建独立文献：发布第 1 版后大幅改动（改字、加行、加抄本、切底本、删组/整批重存），再恢复
+        r = await call(base, 'POST', '/documents', { title: `恢复旧版测试 ${++seq}`, manuscripts: ['甲', '乙', '丙'] });
+        assert.strictEqual(r.status, 201);
+        const dRestore = r.json.id;
+        let rsView = (await call(base, 'GET', `/documents/${dRestore}`)).json;
+        let rsVer = rsView.document.version;
+        const [rsA, rsB, rsC] = rsView.manuscripts;
+        await call(base, 'POST', `/manuscripts/${rsA.id}/lines`, { expectedVersion: rsVer++, content: '天命之謂性率性之謂道' });
+        await call(base, 'POST', `/manuscripts/${rsA.id}/lines`, { expectedVersion: rsVer++, content: '修道之謂教' });
+        await call(base, 'POST', `/manuscripts/${rsB.id}/lines`, { expectedVersion: rsVer++, content: '天命之謂姓率性之謂道' });
+        await call(base, 'POST', `/manuscripts/${rsB.id}/lines`, { expectedVersion: rsVer++, content: '修道之謂教也' });
+        await call(base, 'POST', `/manuscripts/${rsC.id}/lines`, { expectedVersion: rsVer++, content: '天命之謂性' });
+        await call(base, 'POST', `/manuscripts/${rsC.id}/lines`, { expectedVersion: rsVer++, content: '修道之謂教' });
+        rsView = (await call(base, 'GET', `/documents/${dRestore}`)).json;
+        const rsl = (msId, no) => rsView.rawByMs.find((x) => x.msId === msId).lines.find((l) => l.lineNo === no).lineId;
+        const ed1Groups = [
+            { ord: 1, fragments: [
+                    { msId: rsA.id, lineId: rsl(rsA.id, 1), startCp: 0, endCp: 5 },
+                    { msId: rsB.id, lineId: rsl(rsB.id, 1), startCp: 0, endCp: 5 },
+                    { msId: rsC.id, lineId: rsl(rsC.id, 1), startCp: 0, endCp: 5 },
+                ] },
+            { ord: 2, fragments: [
+                    { msId: rsA.id, lineId: rsl(rsA.id, 1), startCp: 5, endCp: 10 },
+                    { msId: rsB.id, lineId: rsl(rsB.id, 1), startCp: 5, endCp: 10 },
+                    { msId: rsC.id, missing: true },
+                ] },
+            { ord: 3, fragments: [
+                    { msId: rsA.id, lineId: rsl(rsA.id, 2), startCp: 0, endCp: 5 },
+                    { msId: rsB.id, lineId: rsl(rsB.id, 2), startCp: 0, endCp: 5 },
+                    { msId: rsC.id, lineId: rsl(rsC.id, 2), startCp: 0, endCp: 5 },
+                ] },
+        ];
+        r = await call(base, 'PUT', `/documents/${dRestore}/groups`, { expectedVersion: rsView.document.version, groups: ed1Groups });
+        assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+        // 发布第 1 版
+        rsView = (await call(base, 'GET', `/documents/${dRestore}`)).json;
+        r = await call(base, 'POST', `/documents/${dRestore}/publish`, { expectedVersion: rsView.document.version });
+        assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+        assert.strictEqual(r.json.editionNo, 1);
+        const ed1Snapshot = (await call(base, 'GET', `/documents/${dRestore}/editions/1`)).json.view;
+        rsView = (await call(base, 'GET', `/documents/${dRestore}`)).json;
+        const restoreBaseVersion = rsView.document.version;
+        assert.strictEqual(ed1Snapshot.document.version, restoreBaseVersion);
+        // 发布后大幅改动工作版：
+        //  改字（乙行1 姓→性）、乙加第 3 行、新增抄本丁、切换底本到乙、整批重存（只留 1 组，组 ID 全换）
+        rsVer = restoreBaseVersion;
+        const rsBLine1 = rsl(rsB.id, 1);
+        await call(base, 'PUT', `/lines/${rsBLine1}`, {
+            expectedVersion: rsVer++, startCp: 4, endCp: 5, replacement: '性',
+        });
+        await call(base, 'POST', `/manuscripts/${rsB.id}/lines`, { expectedVersion: rsVer++, content: '新增的乙本第三行' });
+        await call(base, 'POST', `/documents/${dRestore}/manuscripts`, { expectedVersion: rsVer++, name: '丁' });
+        rsView = (await call(base, 'GET', `/documents/${dRestore}`)).json;
+        const rsD = rsView.manuscripts.find((m) => m.name === '丁');
+        const rsBLine1Now = rsView.rawByMs.find((x) => x.msId === rsB.id).lines[0].lineId;
+        r = await call(base, 'PUT', `/documents/${dRestore}/base`, { expectedVersion: rsVer++, msId: rsB.id });
+        assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+        r = await call(base, 'PUT', `/documents/${dRestore}/groups`, {
+            expectedVersion: rsVer++,
+            groups: [{ ord: 1, fragments: [{ msId: rsB.id, lineId: rsBLine1Now, startCp: 0, endCp: 5 }] }],
+        });
+        assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+        rsView = (await call(base, 'GET', `/documents/${dRestore}`)).json;
+        const versionBeforeRestore = rsView.document.version;
+        assert.ok(versionBeforeRestore > restoreBaseVersion);
+        // 改动后的工作版：底本为乙、4 份抄本、乙 3 行、仅 1 组
+        assert.strictEqual(rsView.document.baseMsId, rsB.id);
+        assert.strictEqual(rsView.manuscripts.length, 4);
+        assert.strictEqual(rsView.rawByMs.find((x) => x.msId === rsB.id).lines.length, 3);
+        assert.strictEqual(rsView.stats.groupCount, 1);
+        // 对照应显示大量差异
+        let rsDiff = (await call(base, 'GET', `/documents/${dRestore}/editions/1/diff`)).json;
+        assert.strictEqual(rsDiff.baseSame, false);
+        // 版本过期 → 409 拒绝且不改动
+        r = await call(base, 'POST', `/documents/${dRestore}/editions/1/restore`, { expectedVersion: versionBeforeRestore - 1 });
+        await expectFail(r, 409, '版本已过期');
+        rsView = (await call(base, 'GET', `/documents/${dRestore}`)).json;
+        assert.strictEqual(rsView.document.version, versionBeforeRestore, '409 不推进版本');
+        assert.strictEqual(rsView.stats.groupCount, 1, '409 不改动数据');
+        // 目标版不存在 → 404 拒绝且不改动
+        r = await call(base, 'POST', `/documents/${dRestore}/editions/99/restore`, { expectedVersion: versionBeforeRestore });
+        await expectFail(r, 404, '不存在');
+        assert.strictEqual((await call(base, 'GET', `/documents/${dRestore}`)).json.document.version, versionBeforeRestore);
+        // 文献不存在 → 404
+        await expectFail(await call(base, 'POST', '/documents/999999/editions/1/restore', { expectedVersion: 1 }), 404, '不存在');
+        // 缺少 expectedVersion → 400
+        await expectFail(await call(base, 'POST', `/documents/${dRestore}/editions/1/restore`, {}), 400, 'expectedVersion');
+        // 执行恢复：携带对照时的 expectedVersion
+        r = await call(base, 'POST', `/documents/${dRestore}/editions/1/restore`, { expectedVersion: versionBeforeRestore });
+        assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+        assert.strictEqual(r.json.ok, true);
+        assert.strictEqual(r.json.editionNo, 1);
+        assert.strictEqual(r.json.version, versionBeforeRestore + 1, '成功后版本号只前进一次');
+        assert.strictEqual(r.json.manuscriptCount, 3);
+        assert.strictEqual(r.json.lineCount, 6);
+        assert.strictEqual(r.json.groupCount, 3);
+        assert.strictEqual(r.json.baseMsId, rsA.id, '底本恢复为甲');
+        // 恢复后工作版 == 第 1 版快照内容
+        rsView = (await call(base, 'GET', `/documents/${dRestore}`)).json;
+        assert.strictEqual(rsView.document.version, versionBeforeRestore + 1);
+        assert.strictEqual(rsView.document.baseMsId, rsA.id);
+        assert.strictEqual(rsView.document.publishedVer, 1, '已发布版编号保持原样');
+        assert.deepStrictEqual(rsView.manuscripts.map((m) => [m.id, m.name, m.position]), ed1Snapshot.manuscripts.map((m) => [m.id, m.name, m.position]), '抄本及顺序恢复（id 沿用，新增的丁删除）');
+        assert.strictEqual(rsView.manuscripts.length, 3);
+        assert.ok(!rsView.manuscripts.some((m) => m.id === rsD.id), '发布后新增的抄本丁应被删除');
+        assert.deepStrictEqual(rsView.rawByMs.map((rb) => [rb.msId, rb.lines.map((l) => [l.lineNo, l.content])]), ed1Snapshot.rawByMs.map((rb) => [rb.msId, rb.lines.map((l) => [l.lineNo, l.content])]), '全部原始行及顺序恢复');
+        assert.strictEqual(rsView.stats.groupCount, 3);
+        assert.strictEqual(rsView.stats.brokenCount, 0, '重建后的组全部完好');
+        const restoredGroup2 = rsView.groups.find((g) => g.ord === 2);
+        assert.ok(restoredGroup2.cells.find((c) => c.msId === rsC.id).missing, '缺文标记恢复');
+        assert.strictEqual(restoredGroup2.cells.find((c) => c.msId === rsA.id).text, '率性之謂道');
+        assert.strictEqual(rsView.groups.find((g) => g.ord === 1).cells.find((c) => c.msId === rsB.id).text, '天命之謂姓', '乙行1 文字恢复为发布时的「姓」');
+        // 重建后的行与组取得“当前有效标识”：组 id 与快照 id 不同（整批重存换过 id），但可正常编辑/修复/删除
+        const restoredG1 = rsView.groups.find((g) => g.ord === 1);
+        const restoredG1Id = restoredG1.id;
+        assert.notStrictEqual(restoredG1Id, ed1Snapshot.groups[0].id, '重建后的组取得新的当前有效 id');
+        const restoredALine2 = rsView.rawByMs.find((x) => x.msId === rsA.id).lines.find((l) => l.lineNo === 2).lineId;
+        // 修复片段须引用恢复后当前有效的行 id（按行号从新视图定位）
+        const restoredG1Fragments = restoredG1.cells.map((c) => {
+            const lid = rsView.rawByMs.find((x) => x.msId === c.msId)
+                .lines.find((l) => l.lineNo === c.lineNo).lineId;
+            return { msId: c.msId, lineId: lid, startCp: c.startCp, endCp: c.endCp };
+        });
+        r = await call(base, 'PUT', `/documents/${dRestore}/groups/${restoredG1Id}/repair`, {
+            expectedVersion: rsView.document.version,
+            group: { ord: 1, fragments: restoredG1Fragments },
+        });
+        assert.strictEqual(r.status, 200, '现有修复流程在新组 id 上仍可用');
+        rsView = (await call(base, 'GET', `/documents/${dRestore}`)).json;
+        r = await call(base, 'PUT', `/lines/${restoredALine2}`, {
+            expectedVersion: rsView.document.version, startCp: 0, endCp: 1, replacement: '脩',
+        });
+        assert.strictEqual(r.status, 200, '现有改字流程在新行 id 上仍可用');
+        rsView = (await call(base, 'GET', `/documents/${dRestore}`)).json;
+        assert.strictEqual(rsView.stats.brokenCount, 1, '改字照常使相交组待修复');
+        // 恢复后先把改动撤回，再修复受影响组并发布第 2 版：发布流程仍可用，第 1 版快照保持原样
+        r = await call(base, 'PUT', `/lines/${restoredALine2}`, {
+            expectedVersion: rsView.document.version, startCp: 0, endCp: 1, replacement: '修',
+        });
+        assert.strictEqual(r.status, 200);
+        rsView = (await call(base, 'GET', `/documents/${dRestore}`)).json;
+        const brokenG = rsView.groups.find((g) => g.broken);
+        // 按当前视图的行号重新定位行 id（恢复后行 id 已全部换新）
+        const repairFragments = brokenG.cells.map((c) => {
+            if (c.missing)
+                return { msId: c.msId, missing: true };
+            const lid = rsView.rawByMs.find((x) => x.msId === c.msId)
+                .lines.find((l) => l.lineNo === c.lineNo).lineId;
+            return { msId: c.msId, lineId: lid, startCp: c.startCp, endCp: c.endCp };
+        });
+        r = await call(base, 'PUT', `/documents/${dRestore}/groups/${brokenG.id}/repair`, {
+            expectedVersion: rsView.document.version,
+            group: { ord: brokenG.ord, fragments: repairFragments },
+        });
+        assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+        rsView = (await call(base, 'GET', `/documents/${dRestore}`)).json;
+        assert.strictEqual(rsView.stats.brokenCount, 0);
+        r = await call(base, 'POST', `/documents/${dRestore}/publish`, { expectedVersion: rsView.document.version });
+        assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+        assert.strictEqual(r.json.editionNo, 2);
+        const ed1After = (await call(base, 'GET', `/documents/${dRestore}/editions/1`)).json;
+        assert.deepStrictEqual(ed1After.view, ed1Snapshot, '第 1 版快照始终保持原样');
+        // 恢复幂等：再次从第 1 版恢复，内容仍一致，版本再前进一次
+        rsView = (await call(base, 'GET', `/documents/${dRestore}`)).json;
+        r = await call(base, 'POST', `/documents/${dRestore}/editions/1/restore`, { expectedVersion: rsView.document.version });
+        assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+        assert.strictEqual(r.json.version, rsView.document.version + 1);
+        assert.strictEqual(r.json.groupCount, 3);
+        rsView = (await call(base, 'GET', `/documents/${dRestore}`)).json;
+        assert.strictEqual(rsView.document.publishedVer, 2, '已发布至第 2 版；恢复不改变编号与快照');
+        rsDiff = (await call(base, 'GET', `/documents/${dRestore}/editions/1/diff`)).json;
+        assert.strictEqual(rsDiff.groupDiff.counts.paired, 3);
+        assert.strictEqual(rsDiff.groupDiff.unpairedOld.length, 0);
+        assert.strictEqual(rsDiff.groupDiff.unpairedNew.length, 0);
+        assert.strictEqual(rsDiff.textChanges.length, 0, '恢复后工作版与第 1 版行文完全一致');
+        // 标题不在恢复范围：改标题后恢复，标题保持当前值
+        {
+            const { query } = await Promise.resolve().then(() => __importStar(require('./db')));
+            await query('UPDATE documents SET title=$1 WHERE id=$2', [`恢复后标题不回退 ${seq}`, dRestore]);
+        }
+        rsView = (await call(base, 'GET', `/documents/${dRestore}`)).json;
+        const verForTitleRestore = rsView.document.version;
+        r = await call(base, 'POST', `/documents/${dRestore}/editions/1/restore`, { expectedVersion: verForTitleRestore });
+        assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+        rsView = (await call(base, 'GET', `/documents/${dRestore}`)).json;
+        assert.strictEqual(rsView.document.title, `恢复后标题不回退 ${seq}`, '文献标题保持原样，不随快照回退');
+        // 快照损坏（无法构成合法归组）→ 422 SNAPSHOT_NOT_RESTORABLE，整体拒绝、数据不动
+        {
+            const { query } = await Promise.resolve().then(() => __importStar(require('./db')));
+            // 取第 1 版快照，把组2 乙片段改到越界区间（行共 10 字 → endCp=99）
+            const snap = JSON.parse(JSON.stringify(ed1Snapshot));
+            const badG2 = snap.groups.find((g) => g.ord === 2);
+            const badB = badG2.cells.find((c) => c.msId === rsB.id);
+            badB.endCp = 99;
+            await query('INSERT INTO editions (doc_id, edition_no, snapshot) VALUES ($1, 91, $2)', [dRestore, JSON.stringify(snap)]);
+        }
+        rsView = (await call(base, 'GET', `/documents/${dRestore}`)).json;
+        const verBeforeBad = rsView.document.version;
+        const groupCountBeforeBad = rsView.stats.groupCount;
+        r = await call(base, 'POST', `/documents/${dRestore}/editions/91/restore`, { expectedVersion: verBeforeBad });
+        assert.strictEqual(r.status, 422, JSON.stringify(r.json));
+        assert.ok(JSON.stringify(r.json).includes('无法构成合法归组'));
+        assert.strictEqual(r.json.details.code, 'SNAPSHOT_NOT_RESTORABLE');
+        assert.ok(Array.isArray(r.json.details.issues) && r.json.details.issues.length > 0);
+        assert.ok(r.json.details.issues.some((i) => i.groupOrd === 2 && i.msId === rsB.id), '问题须定位到组2/乙本');
+        rsView = (await call(base, 'GET', `/documents/${dRestore}`)).json;
+        assert.strictEqual(rsView.document.version, verBeforeBad, '422 不推进版本');
+        assert.strictEqual(rsView.stats.groupCount, groupCountBeforeBad, '422 不改动任何数据');
+        // 快照结构整体损坏 → 同样 422
+        {
+            const { query } = await Promise.resolve().then(() => __importStar(require('./db')));
+            await query('INSERT INTO editions (doc_id, edition_no, snapshot) VALUES ($1, 92, $2)', [
+                dRestore, JSON.stringify({ notASnapshot: true }),
+            ]);
+        }
+        r = await call(base, 'POST', `/documents/${dRestore}/editions/92/restore`, { expectedVersion: verBeforeBad });
+        await expectFail(r, 422, '无法构成合法归组');
+        assert.strictEqual(r.json.details.code, 'SNAPSHOT_NOT_RESTORABLE');
+        console.log('✅ 恢复旧版测试通过');
         console.log('✅ 全部集成测试通过');
     }
     finally {

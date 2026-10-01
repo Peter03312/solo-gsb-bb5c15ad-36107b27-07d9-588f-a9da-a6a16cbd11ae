@@ -219,6 +219,8 @@ curl -X POST http://localhost:4000/api/documents/1/reline \
 ### 发布与旧版
 - 发布生成 **不可变快照**（JSONB，固化发布定稿时的版本号）。发布后继续修改只影响工作版，
   **旧发布版始终可阅读**（“发布与旧版”页签 → 阅读此版）。
+- 在版本对照页可将工作版 **整体恢复为任一已发布版**（见下节“恢复为已发布校勘版”）；
+  恢复不改动标题、已发布版编号与任何快照。
 
 ### 版本对照（任一已发布校勘版 ↔ 当前工作版）
 - 在“发布与旧版”页签对任一已发布版本点 **“与当前工作版对照”**（或在旧版阅读页点同名按钮），
@@ -244,6 +246,55 @@ curl -X POST http://localhost:4000/api/documents/1/reline \
   返回：`sides`（两侧底本/版本号/组数/待修复数）、`textChanges`（行文增删改）、
   `groupDiff.paired`（配对组的组序与各抄本片段、缺文变化）、
   `groupDiff.unpairedOld / unpairedNew`（未配对旧/新组及原因）。
+
+### 恢复为已发布校勘版（对照确认后，整体重建工作版）
+整理者在“发布与旧版”中选取一个**已发布校勘版**，点 **“与当前工作版对照”** 查看差异、
+确认无误后，可在版本对照页点 **“确认为此版恢复工作版”**（也可直接调 HTTP API）。
+
+- **恢复范围（一律以该版快照为准，工作版原有的行 / 组清空重建）**：
+  - 抄本集合及**顺序**（快照之外新增的抄本删除；快照内抄本沿用其稳定 id，名称 / 位置复位）；
+  - **底本**；
+  - 各抄本**全部原始行**（重新插入，取得当前有效行 id，行号按快照）；
+  - **全部对应组**及其各抄本**片段与缺文标记**（重新建组，取得当前有效组 id，组全部完好）。
+- **不恢复 / 保持原样**：文献**标题**、**已发布版编号**（`published_ver`）与 editions 中的
+  **全部快照**（不可变；刚恢复所依据的旧版以及更新的版本都仍可阅读、可再次对照）。
+- **并发与拒绝（任何拒绝都整体回滚、绝不部分写入、版本号不前进）**：
+  - 请求必须携带**对照时的工作版版本号** `expectedVersion`（乐观锁）；
+    期间版本已变化 → **409**，提示刷新后重新对照再确认；
+  - 目标版不存在 → **404**（提示当前已发布至第几版）；文献不存在 → **404**；
+  - 快照内容**无法构成合法归组**（结构损坏 / 引用缺失 / 越界 / 行内重叠 /
+    每组底本片段不唯一 / 缺文标在底本 / 组序不连续 / 快照内片段文字与行文自相矛盾等）
+    → **422** `details.code=SNAPSHOT_NOT_RESTORABLE`，`details.issues[]` 逐条给出
+    `code` 与位置（组序 / 抄本 / 行号 / 码点区间）并说明原因，**整体拒绝、不改动任何数据**；
+  - 请求体缺少整数 `expectedVersion` → 400。
+- **成功语义**：
+  - 工作版**版本号只前进一次**，响应返回新 `version`；
+  - 重建后的**行和组取得当前有效标识**（新行 id / 新组 id；旧 id 一律不再使用）；
+  - 现有的**改字 / 归组 / 修复 / 删除组 / 补配 / 行界调整 / 版本对照 / 发布**流程全部照常可用，
+    修复 / 改字时按恢复后视图中的行 id、组 id 提交即可；
+  - 恢复可重复执行（幂等：内容总回到同一快照，每次成功版本号 +1）。
+- 接口：`POST /api/documents/:id/editions/:no/restore`，请求体 `{ "expectedVersion": N }`
+  （N 取“与当前工作版对照”响应 `sides.new.version`，即对照时工作区头部的版本号）。例如：
+
+  ```bash
+  # 1) 先对照（只读），记录返回的 sides.new.version（即当前工作版版本号）
+  curl http://localhost:4000/api/documents/1/editions/1/diff
+
+  # 2) 携带对照时的 expectedVersion 确认恢复
+  curl -X POST http://localhost:4000/api/documents/1/editions/1/restore \
+    -H 'Content-Type: application/json' \
+    -d '{ "expectedVersion": 12 }'
+  ```
+
+  成功返回：
+
+  ```json
+  { "ok": true, "editionNo": 1, "version": 13, "baseMsId": 7,
+    "manuscriptCount": 3, "lineCount": 6, "groupCount": 3 }
+  ```
+
+  版本过期：`409 { "error": "版本已过期：您基于版本 12 修改，当前版本为 13…", "details": { "currentVersion": 13 } }`；
+  快照无法归组：`422 { "error": "该已发布版快照无法构成合法归组：…", "details": { "code": "SNAPSHOT_NOT_RESTORABLE", "issues": [ … ] } }`。
 
 
 ### 并发控制
@@ -274,6 +325,7 @@ curl -X POST http://localhost:4000/api/documents/1/reline \
 | POST | `/api/documents/:id/publish` | 发布新版（有待修复组则 409） |
 | GET | `/api/documents/:id/editions` / `…/editions/:no` | 版本列表 / 阅读旧版快照 |
 | GET | `/api/documents/:id/editions/:no/diff` | **该已发布版与当前工作版的版本对照**（旧版不存在 → 404） |
+| POST | `/api/documents/:id/editions/:no/restore` | **从该已发布版整体恢复工作版**（携带对照时 `expectedVersion`；过期 409 / 目标版不存在 404 / 快照无法合法归组 422 `SNAPSHOT_NOT_RESTORABLE`，皆不改动数据；成功版本只 +1，行与组取得当前有效标识） |
 
 写请求体均含 `expectedVersion`；错误响应：`{ "error": "...", "details": [ { "code", "message", "groupOrd", "msName", "lineNo", ... } ] }`。
 
@@ -304,7 +356,13 @@ npm test
 缺文标记不变、合并右行片段迁至左行且原待修复组不自动转完好、行号顺移、发布后快照保持原样、
 发布门禁与待修复一致（待修复 409、修复后放行）、非法码点位置/非相邻行/自身合并/跨抄本/他文献行 400、
 行或文献不存在 404、扩展 B 区生僻字按码点拆分、预览只读不推进、缺 basis 400、
-过期版本 409 与 basis 不符 409（RELINE_STALE）皆整次拒绝不推进、成功只推进一次版本**。
+过期版本 409 与 basis 不符 409（RELINE_STALE）皆整次拒绝不推进、成功只推进一次版本，以及
+**恢复旧版：恢复后抄本及顺序/底本/全部原始行/组片段与缺文标记与快照一致、发布后新增抄本被删除而快照抄本沿用稳定 id、
+重建后行与组取得当前有效新 id（改字/修复/发布/对照等现有流程在新 id 上照常可用）、
+标题与已发布版编号及全部快照保持原样、第 1 版快照不受后续恢复与再发布影响、恢复幂等、
+版本只前进一次、恢复后与该版对照行文零差异、版本过期 409 / 目标版不存在 404 / 缺 expectedVersion 400
+均不改动数据、损坏快照（越界片段 / 顶层结构损坏）→ 422 SNAPSHOT_NOT_RESTORABLE 且 issues 定位到组与抄本、
+422 整体拒绝不推进版本也不改动任何数据**。
 
 ---
 
@@ -316,7 +374,7 @@ npm test
 ├── docker-compose.yml        # 一键：db(PostgreSQL 16) + app
 ├── db/schema.sql             # 数据库结构（幂等，可重复执行）
 ├── server/                   # Node.js + TypeScript + Express
-│   └── src/ (db/validate/collation/diff/supplement/reline/routes/repo/...)
+│   └── src/ (db/validate/collation/diff/supplement/reline/restore/routes/repo/...)
 └── web/                      # React 18 + Vite + TypeScript
     └── src/ (录文 / 归组 / 对照 / 发布与旧版 / 版本对照)
 ```

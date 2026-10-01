@@ -9,6 +9,7 @@ import {
   recheckSelections,
 } from './supplement';
 import { applyReLinePlan, buildReLinePlan } from './reline';
+import { applyRestore, buildRestorePlan } from './restore';
 import { charLen, HttpError, isInt, sliceCp } from './util';
 import {
   bumpVersion,
@@ -669,6 +670,47 @@ router.get(
     );
     if (rows.length === 0) throw new HttpError(404, `校勘版 #${no} 不存在（旧版永久保留可读）`);
     res.json({ editionNo: rows[0].edition_no, createdAt: rows[0].created_at, view: rows[0].snapshot });
+  })
+);
+
+/**
+ * 从已发布校勘版恢复当前工作版：
+ *   POST /api/documents/:id/editions/:no/restore { expectedVersion }
+ * 整理者在“发布与旧版 / 版本对照”确认后调用。以快照整体重建：
+ * 抄本及顺序、底本、全部原始行、全部对应组的片段与缺文标记；
+ * 文献标题、已发布版编号与全部快照保持原样。
+ *  - 版本过期（expectedVersion ≠ 当前版本）→ 409，不改动数据；
+ *  - 目标版不存在 → 404，不改动数据；
+ *  - 快照无法构成合法归组 → 422 SNAPSHOT_NOT_RESTORABLE（details.issues 逐条说明），整体拒绝；
+ *  - 成功后工作版版本号只前进一次，返回新版本号；重建后的行与组取得当前有效标识。
+ */
+router.post(
+  '/documents/:id/editions/:no/restore',
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const no = Number(req.params.no);
+    if (!isInt(no) || no < 1) throw new HttpError(400, '校勘版编号必须是正整数');
+    const result = await withTx(async (c) => {
+      const doc = await lockDoc(c, id);
+      checkVersion(doc, req.body?.expectedVersion);
+      const { rows } = await c.query<{ snapshot: unknown }>(
+        'SELECT snapshot FROM editions WHERE doc_id=$1 AND edition_no=$2',
+        [id, no]
+      );
+      if (rows.length === 0) {
+        throw new HttpError(
+          404,
+          doc.published_ver === 0
+            ? `校勘版 #${no} 不存在：本文献尚未发布过任何校勘版，无法恢复`
+            : `校勘版 #${no} 不存在：当前仅发布至第 ${doc.published_ver} 版，无法恢复`,
+          { requestedEdition: no, latestEdition: doc.published_ver }
+        );
+      }
+      // 快照合法性在任何写入之前校验：不合法 → 422，事务回滚，数据不动
+      const plan = buildRestorePlan(rows[0].snapshot);
+      return applyRestore(c, id, no, plan);
+    });
+    res.json({ ok: true, ...result });
   })
 );
 

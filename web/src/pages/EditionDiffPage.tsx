@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { api } from '../api';
+import { api, ApiError } from '../api';
 import type {
   CellChange,
   EditionDiff,
@@ -10,7 +10,8 @@ import type {
 
 /**
  * 版本对照页：任一已发布校勘版（旧 · 不可变快照）vs 当前工作版（新 · 实时）。
- * 只读：本页不做任何写操作；点“刷新”即按当前最新工作版重新对照。
+ * 默认只读；整理者确认对照无误后，可在本页点“确认为此版恢复工作版”，
+ * 携带对照时的工作版版本号（expectedVersion）提交恢复。
  * 页面数据与 GET /api/documents/:id/editions/:no/diff 返回的 JSON 完全一致。
  */
 export function EditionDiffPage({
@@ -18,15 +19,20 @@ export function EditionDiffPage({
   editionNo,
   onBack,
   onHome,
+  onRestored,
 }: {
   docId: number;
   editionNo: number;
   onBack: () => void;
   onHome: () => void;
+  onRestored: (newVersion: number) => void;
 }) {
   const [data, setData] = useState<EditionDiff | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [restoring, setRestoring] = useState(false);
+  const [restoreErr, setRestoreErr] = useState<string | null>(null);
+  const [restoreIssues, setRestoreIssues] = useState<unknown>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -44,6 +50,31 @@ export function EditionDiffPage({
   useEffect(() => {
     load();
   }, [load]);
+
+  const restore = async () => {
+    if (!data) return;
+    const expectedVersion = data.sides.new.version;
+    const ok = window.confirm(
+      `确认为第 ${editionNo} 版恢复当前工作版？\n\n` +
+      '将以该已发布版快照整体重建：抄本及顺序、底本、全部原始行、对应组的片段与缺文标记；\n' +
+      '文献标题、已发布版编号与快照本身保持不变。\n' +
+      `本次提交基于对照时的工作版 v${expectedVersion}，版本已变化会被拒绝。`
+    );
+    if (!ok) return;
+    setRestoring(true);
+    setRestoreErr(null);
+    setRestoreIssues(null);
+    try {
+      const r = await api.restoreEdition(docId, editionNo, expectedVersion);
+      onRestored(r.version);
+    } catch (e) {
+      const ae = e as ApiError;
+      setRestoreErr(ae.message ?? String(e));
+      setRestoreIssues(ae.details ?? null);
+    } finally {
+      setRestoring(false);
+    }
+  };
 
   const apiUrl = `/api/documents/${docId}/editions/${editionNo}/diff`;
 
@@ -94,6 +125,36 @@ export function EditionDiffPage({
               <pre className="api-example">{`GET ${apiUrl}
 
 curl ${typeof window !== 'undefined' ? window.location.origin : ''}${apiUrl}`}</pre>
+            </div>
+
+            <div className="card restore-card">
+              <h3>确认为此版恢复工作版</h3>
+              <div className="muted" style={{ marginBottom: 10 }}>
+                对照无误后可将当前工作版<strong>整体恢复为第 {editionNo} 版快照</strong>：
+                抄本及顺序、底本、全部原始行、对应组片段与缺文标记一律以该版为准重建；
+                文献标题、已发布版编号与全部快照保持原样。重建后的行与组取得当前有效标识，
+                现有编辑 / 对照 / 发布流程仍可继续使用。提交携带对照时的版本号
+                <strong> v{data.sides.new.version}</strong>；期间版本已变化、目标版不存在或快照无法构成合法归组时，
+                服务端整体拒绝且不改动任何数据。
+              </div>
+              {restoreErr && (
+                <div className="error-box" style={{ marginBottom: 10 }}>
+                  恢复被拒绝：{restoreErr}
+                  {Array.isArray(restoreIssues) && (restoreIssues as unknown[]).length > 0 && (
+                    <ul style={{ margin: '6px 0 0 18px' }}>
+                      {(restoreIssues as Array<{ message?: string }>).map((it, i) => (
+                        <li key={i}>{it.message}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
+              <pre className="api-example">{`curl -X POST ${typeof window !== 'undefined' ? window.location.origin : ''}/api/documents/${docId}/editions/${editionNo}/restore \\
+  -H 'Content-Type: application/json' \\
+  -d '{"expectedVersion": ${data.sides.new.version}}'`}</pre>
+              <button className="danger" disabled={restoring} onClick={restore} style={{ marginTop: 10 }}>
+                {restoring ? '恢复中…' : `确认为第 ${editionNo} 版恢复工作版`}
+              </button>
             </div>
 
             {!data.baseSame && (

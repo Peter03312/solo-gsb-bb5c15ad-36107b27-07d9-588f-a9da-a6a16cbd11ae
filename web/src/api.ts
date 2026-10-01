@@ -89,6 +89,8 @@ export const api = {
       | { op: 'split'; lineId: number; splitCp: number; basis: ReLineBasis }
       | { op: 'merge'; leftLineId: number; rightLineId: number; basis: ReLineBasis }
   ) => req<ReLineResult>('POST', `/api/documents/${id}/reline`, { expectedVersion, ...body }),
+  restoreEdition: (id: number, editionNo: number, expectedVersion: number) =>
+    req<RestoreResult>('POST', `/api/documents/${id}/editions/${editionNo}/restore`, { expectedVersion }),
 };
 
 import type {
@@ -99,6 +101,7 @@ import type {
   ReLineBasis,
   ReLinePreview,
   ReLineResult,
+  RestoreResult,
   SupplementPreview,
   SupplementResult,
   SupplementSelection,
